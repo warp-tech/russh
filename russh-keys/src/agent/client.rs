@@ -100,6 +100,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
             self.buf.push(msg::ADD_ID_CONSTRAINED)
         }
         match *key {
+            #[cfg(feature = "rs-crypto")]
             key::KeyPair::Ed25519(ref pair) => {
                 self.buf.extend_ssh_string(b"ssh-ed25519");
                 self.buf.extend_ssh_string(pair.public.as_bytes());
@@ -262,6 +263,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
                             hash: SignatureHash::SHA2_512,
                         })
                     }
+                    #[cfg(feature = "rs-crypto")]
                     b"ssh-ed25519" => keys.push(PublicKey::Ed25519(
                         ed25519_dalek::PublicKey::from_bytes(r.read_string()?)?,
                     )),
@@ -319,6 +321,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
         key_blob(public, &mut self.buf)?;
         self.buf.extend_ssh_string(data);
         debug!("public = {:?}", public);
+        #[allow(unreachable_patterns)] // may not be unreachable depending on build flags
         let hash = match public {
             #[cfg(feature = "openssl")]
             PublicKey::RSA { hash, .. } => match hash {
@@ -515,6 +518,7 @@ fn key_blob(public: &key::PublicKey, buf: &mut CryptoVec) -> Result<(), Error> {
             #[allow(clippy::indexing_slicing)] // length is known
             BigEndian::write_u32(&mut buf[5..], (len1 - len0) as u32);
         }
+        #[cfg(feature = "rs-crypto")]
         PublicKey::Ed25519(ref p) => {
             buf.extend(&[0, 0, 0, 0]);
             let len0 = buf.len();

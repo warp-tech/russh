@@ -53,6 +53,7 @@ pub struct Preferred {
 }
 
 const KEX_ORDER: &[kex::Name] = &[
+    #[cfg(feature = "rs-crypto")]
     kex::CURVE25519,
     kex::DH_G14_SHA256,
     kex::DH_G14_SHA1,
@@ -62,7 +63,9 @@ const KEX_ORDER: &[kex::Name] = &[
 ];
 
 const CIPHER_ORDER: &[cipher::Name] = &[
+    #[cfg(feature = "rs-crypto")]
     cipher::CHACHA20_POLY1305,
+    #[cfg(feature = "rs-crypto")]
     cipher::AES_256_GCM,
     cipher::AES_256_CTR,
     cipher::AES_192_CTR,
@@ -82,8 +85,17 @@ const HMAC_ORDER: &[mac::Name] = &[
 impl Preferred {
     #[cfg(feature = "openssl")]
     pub const DEFAULT: Preferred = Preferred {
-        kex: &[kex::CURVE25519, kex::DH_G14_SHA256],
-        key: &[key::ED25519, key::RSA_SHA2_256, key::RSA_SHA2_512],
+        kex: &[
+            #[cfg(feature = "rs-crypto")]
+            kex::CURVE25519,
+            kex::DH_G14_SHA256,
+            ],
+        key: &[
+            #[cfg(feature = "rs-crypto")]
+            key::ED25519,
+            key::RSA_SHA2_256,
+            key::RSA_SHA2_512,
+            ],
         cipher: CIPHER_ORDER,
         mac: HMAC_ORDER,
         compression: &["none", "zlib", "zlib@openssh.com"],
@@ -100,7 +112,12 @@ impl Preferred {
 
     pub const COMPRESSED: Preferred = Preferred {
         kex: KEX_ORDER,
-        key: &[key::ED25519, key::RSA_SHA2_256, key::RSA_SHA2_512],
+        key: &[
+            #[cfg(feature = "rs-crypto")]
+            key::ED25519,
+            key::RSA_SHA2_256,
+            key::RSA_SHA2_512,
+        ],
         cipher: CIPHER_ORDER,
         mac: HMAC_ORDER,
         compression: &["zlib", "zlib@openssh.com", "none"],
@@ -125,14 +142,15 @@ impl Named for () {
     }
 }
 
-#[cfg(not(feature = "openssl"))]
+#[cfg(feature = "rs-crypto")]
 use russh_keys::key::ED25519;
 #[cfg(feature = "openssl")]
-use russh_keys::key::{ED25519, SSH_RSA};
+use russh_keys::key::SSH_RSA;
 
 impl Named for PublicKey {
     fn name(&self) -> &'static str {
         match self {
+            #[cfg(feature = "rs-crypto")]
             PublicKey::Ed25519(_) => ED25519.0,
             #[cfg(feature = "openssl")]
             PublicKey::RSA { .. } => SSH_RSA.0,
@@ -143,6 +161,7 @@ impl Named for PublicKey {
 impl Named for KeyPair {
     fn name(&self) -> &'static str {
         match self {
+            #[cfg(feature = "rs-crypto")]
             KeyPair::Ed25519 { .. } => ED25519.0,
             #[cfg(feature = "openssl")]
             KeyPair::RSA { ref hash, .. } => hash.name().0,

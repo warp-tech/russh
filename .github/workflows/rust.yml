@@ -19,6 +19,9 @@ jobs:
     - name: Build (no features enabled)
       run: cargo build --verbose
 
+    - name: Build (OpenSSL only)
+      run: cargo build --no-default-features --features openssl --verbose
+
     - name: Build (all features enabled)
       run: cargo build --verbose --all-features
 
@@ -39,6 +42,9 @@ jobs:
     - name: Clippy (no features enabled)
       run: cargo clippy -- -D warnings
 
+    - name: Clippy (OpenSSL only)
+      run: cargo clippy --no-default-features --features openssl -- -D warnings
+
     - name: Clippy (all features enabled)
       run: cargo clippy --all-features -- -D warnings
 
@@ -52,6 +58,13 @@ jobs:
       run: |
         eval `ssh-agent`
         cargo test --verbose
+      env:
+        RUST_BACKTRACE: 1
+
+    - name: Test (OpenSSL only)
+      run: |
+        eval `ssh-agent`
+        cargo test --verbose --no-default-features --features openssl
       env:
         RUST_BACKTRACE: 1
 
