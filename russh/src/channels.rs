@@ -1,3 +1,6 @@
+use std::pin::Pin;
+
+use futures::{Future, FutureExt};
 use russh_cryptovec::CryptoVec;
 use tokio::sync::mpsc::{Sender, UnboundedReceiver};
 use log::debug;
@@ -120,7 +123,7 @@ impl<T: From<(ChannelId, ChannelMsg)>> std::fmt::Debug for Channel<T> {
     }
 }
 
-impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> Channel<S> {
+impl<Send: From<(ChannelId, ChannelMsg)> + std::marker::Send + 'static> Channel<Send> {
     pub fn id(&self) -> ChannelId {
         self.id
     }
@@ -180,9 +183,31 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> Channel<S> {
     }
 
     /// Signal a remote process.
-    pub async fn signal(&mut self, signal: Sig) -> Result<(), Error> {
+    pub async fn signal(self, signal: Sig) -> Result<(), Error> {
         self.send_msg(ChannelMsg::Signal { signal }).await?;
+
         Ok(())
+    }
+
+    /// Get a `FnOnce` that can be used to send a signal through this channel
+    pub fn get_signal_sender(
+        &self,
+    ) -> impl FnOnce(Sig) -> Pin<Box<dyn Future<Output = Result<(), Error>> + std::marker::Send>>
+    {
+        let sender = self.sender.clone();
+        let id = self.id;
+
+        move |signal| {
+            async move {
+                sender
+                    .send((id, ChannelMsg::Signal { signal }).into())
+                    .await
+                    .map_err(|_| Error::SendError)?;
+
+                Ok(())
+            }
+            .boxed()
+        }
     }
 
     /// Request the start of a subsystem with the given name.
