@@ -4,18 +4,20 @@ use std::convert::TryFrom;
 use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use bit_vec::BitVec;
 use block_padding::{NoPadding, Pkcs7};
-#[cfg(feature = "openssl")]
-use openssl::pkey::Private;
-#[cfg(feature = "openssl")]
-use openssl::rsa::Rsa;
 #[cfg(test)]
 use rand_core::OsRng;
+#[cfg(not(feature = "openssl"))]
+use rsa::{
+    traits::{PrivateKeyParts, PublicKeyParts},
+    RsaPrivateKey,
+    BigUint
+};
 use yasna::BERReaderSeq;
+#[cfg(feature = "openssl")]
+use {openssl::pkey::Private, openssl::rsa::Rsa};
 use {std, yasna};
 
 use super::Encryption;
-#[cfg(feature = "openssl")]
-use crate::key::SignatureHash;
 use crate::{key, Error};
 
 const PBES2: &[u64] = &[1, 2, 840, 113549, 1, 5, 13];
@@ -23,7 +25,6 @@ const PBKDF2: &[u64] = &[1, 2, 840, 113549, 1, 5, 12];
 const HMAC_SHA256: &[u64] = &[1, 2, 840, 113549, 2, 9];
 const AES256CBC: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 1, 42];
 const ED25519: &[u64] = &[1, 3, 101, 112];
-#[cfg(feature = "openssl")]
 const RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 1];
 
 /// Decode a PKCS#8-encoded private key.
@@ -164,6 +165,59 @@ fn read_key_v1(reader: &mut BERReaderSeq) -> Result<key::KeyPair, Error> {
     }
 }
 
+#[cfg(not(feature = "openssl"))]
+fn write_key_v0(writer: &mut yasna::DERWriterSeq, key: &RsaPrivateKey) {
+    // Construct DER sequence
+    writer.next().write_u32(0); // Version
+    writer.next().write_sequence(|writer| {
+        writer.next().write_oid(&ObjectIdentifier::from_slice(RSA));
+        writer.next().write_null();
+    });
+
+    // Encode key data
+    let bytes = yasna::construct_der(|writer| {
+        let _ = writer.write_sequence(|writer| -> Result<(), Error> {
+            writer.next().write_u32(0); // Version
+            use num_bigint::BigUint;
+
+            writer
+                .next()
+                .write_biguint(&BigUint::from_bytes_be(&key.n().to_bytes_be()));
+            writer
+                .next()
+                .write_biguint(&BigUint::from_bytes_be(&key.e().to_bytes_be()));
+            writer
+                .next()
+                .write_biguint(&BigUint::from_bytes_be(&key.d().to_bytes_be()));
+
+            let primes = key.primes();
+
+            writer.next().write_biguint(&BigUint::from_bytes_be(
+                &primes.get(0).ok_or(Error::IndexOutOfBounds)?.to_bytes_be(),
+            ));
+            writer.next().write_biguint(&BigUint::from_bytes_be(
+                &primes.get(1).ok_or(Error::IndexOutOfBounds)?.to_bytes_be(),
+            ));
+
+            if let (Some(dp), Some(dq), Some(iqmp)) = (key.dp(), key.dq(), key.crt_coefficient()) {
+                writer
+                    .next()
+                    .write_biguint(&BigUint::from_bytes_be(&dp.to_bytes_be()));
+                writer
+                    .next()
+                    .write_biguint(&BigUint::from_bytes_be(&dq.to_bytes_be()));
+                writer
+                    .next()
+                    .write_biguint(&BigUint::from_bytes_be(&iqmp.to_bytes_be()));
+            };
+            Ok(())
+        });
+    });
+
+    // Write encoded bytes
+    writer.next().write_bytes(&bytes);
+}
+
 #[cfg(feature = "openssl")]
 fn write_key_v0(writer: &mut yasna::DERWriterSeq, key: &Rsa<Private>) {
     writer.next().write_u32(0);
@@ -207,7 +261,33 @@ fn write_key_v0(writer: &mut yasna::DERWriterSeq, key: &Rsa<Private>) {
 }
 
 #[cfg(feature = "openssl")]
+fn read_key(reader: &mut BERReaderSeq) -> Result<Rsa<Private>, Error>{
+    use openssl::bn::BigNum;
+    Ok(Rsa::from_private_components(
+        BigNum::from_slice(&reader.next().read_biguint()?.to_bytes_be())?,
+        BigNum::from_slice(&reader.next().read_biguint()?.to_bytes_be())?,
+        BigNum::from_slice(&reader.next().read_biguint()?.to_bytes_be())?,
+        BigNum::from_slice(&reader.next().read_biguint()?.to_bytes_be())?,
+        BigNum::from_slice(&reader.next().read_biguint()?.to_bytes_be())?,
+        BigNum::from_slice(&reader.next().read_biguint()?.to_bytes_be())?,
+        BigNum::from_slice(&reader.next().read_biguint()?.to_bytes_be())?,
+        BigNum::from_slice(&reader.next().read_biguint()?.to_bytes_be())?,
+    )?)
+}
+
+#[cfg(not(feature = "openssl"))]
+fn read_key(reader: &mut BERReaderSeq) -> Result<RsaPrivateKey, Error> {
+    let n = BigUint::from_bytes_be(&reader.next().read_biguint()?.to_bytes_be());
+    let e = BigUint::from_bytes_be(&reader.next().read_biguint()?.to_bytes_be());
+    let d = BigUint::from_bytes_be(&reader.next().read_biguint()?.to_bytes_be());
+    let _ = &reader.next().read_biguint()?.to_bytes_be();
+    let p = BigUint::from_bytes_be(&reader.next().read_biguint()?.to_bytes_be());
+    let q = BigUint::from_bytes_be(&reader.next().read_biguint()?.to_bytes_be());
+    Ok(RsaPrivateKey::from_components(n, e, d, vec![p, q])?)
+}
+
 fn read_key_v0(reader: &mut BERReaderSeq) -> Result<key::KeyPair, Error> {
+    use crate::key::SignatureHash;
     let oid = reader.next().read_sequence(|reader| {
         let oid = reader.next().read_oid()?;
         reader.next().read_null()?;
@@ -215,26 +295,13 @@ fn read_key_v0(reader: &mut BERReaderSeq) -> Result<key::KeyPair, Error> {
     })?;
     if oid.components().as_slice() == RSA {
         let seq = &reader.next().read_bytes()?;
-        let rsa: Result<Rsa<Private>, Error> = yasna::parse_der(seq, |reader| {
+        let rsa = yasna::parse_der(seq, |reader| {
             reader.read_sequence(|reader| {
                 let version = reader.next().read_u32()?;
                 if version != 0 {
                     return Ok(Err(Error::CouldNotReadKey));
                 }
-                use openssl::bn::BigNum;
-                let mut read_key = || -> Result<Rsa<Private>, Error> {
-                    Ok(Rsa::from_private_components(
-                        BigNum::from_slice(&reader.next().read_biguint()?.to_bytes_be())?,
-                        BigNum::from_slice(&reader.next().read_biguint()?.to_bytes_be())?,
-                        BigNum::from_slice(&reader.next().read_biguint()?.to_bytes_be())?,
-                        BigNum::from_slice(&reader.next().read_biguint()?.to_bytes_be())?,
-                        BigNum::from_slice(&reader.next().read_biguint()?.to_bytes_be())?,
-                        BigNum::from_slice(&reader.next().read_biguint()?.to_bytes_be())?,
-                        BigNum::from_slice(&reader.next().read_biguint()?.to_bytes_be())?,
-                        BigNum::from_slice(&reader.next().read_biguint()?.to_bytes_be())?,
-                    )?)
-                };
-                Ok(read_key())
+                Ok(read_key(reader))
             })
         })?;
         Ok(key::KeyPair::RSA {
@@ -244,11 +311,6 @@ fn read_key_v0(reader: &mut BERReaderSeq) -> Result<key::KeyPair, Error> {
     } else {
         Err(Error::CouldNotReadKey)
     }
-}
-
-#[cfg(not(feature = "openssl"))]
-fn read_key_v0(_: &mut BERReaderSeq) -> Result<key::KeyPair, Error> {
-    Err(Error::CouldNotReadKey)
 }
 
 #[test]
@@ -264,7 +326,6 @@ fn test_read_write_pkcs8() {
     let key = decode_pkcs8(&ciphertext, Some(password)).unwrap();
     match key {
         key::KeyPair::Ed25519 { .. } => println!("Ed25519"),
-        #[cfg(feature = "openssl")]
         key::KeyPair::RSA { .. } => println!("RSA"),
     }
 }
@@ -316,7 +377,6 @@ pub fn encode_pkcs8(key: &key::KeyPair) -> Vec<u8> {
     yasna::construct_der(|writer| {
         writer.write_sequence(|writer| match *key {
             key::KeyPair::Ed25519(ref pair) => write_key_v1(writer, pair),
-            #[cfg(feature = "openssl")]
             key::KeyPair::RSA { ref key, .. } => write_key_v0(writer, key),
         })
     })

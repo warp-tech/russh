@@ -2,6 +2,8 @@ use std::convert::TryFrom;
 
 use byteorder::{BigEndian, ByteOrder};
 use log::{debug, info};
+#[cfg(not(feature = "openssl"))]
+use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 use russh_cryptovec::CryptoVec;
 use tokio;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -138,6 +140,31 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
                 self.buf.extend_ssh_mpint(&key.q().unwrap().to_vec());
                 self.buf.extend_ssh_string(b"");
             }
+            #[cfg(not(feature = "openssl"))]
+            key::KeyPair::RSA { ref key, .. } => {
+                use num_bigint_dig::traits::ModInverse;
+
+                self.buf.extend_ssh_string(b"ssh-rsa");
+                self.buf.extend_ssh_mpint(&key.n().to_bytes_be());
+                self.buf.extend_ssh_mpint(&key.e().to_bytes_be());
+                self.buf.extend_ssh_mpint(&key.d().to_bytes_be());
+                let primes = key.primes();
+                if let Some(iqmp) = key.crt_coefficient() {
+                    self.buf.extend_ssh_mpint(&iqmp.to_bytes_be());
+                } else if let Some(iqmp) = &primes
+                    .get(0)
+                    .ok_or(Error::IndexOutOfBounds)?
+                    .mod_inverse(primes.get(1).ok_or(Error::IndexOutOfBounds)?)
+                {
+                    let (_, val) = &iqmp.to_bytes_be();
+                    self.buf.extend_ssh_mpint(val);
+                }
+                self.buf
+                    .extend_ssh_mpint(&primes.get(0).ok_or(Error::IndexOutOfBounds)?.to_bytes_be());
+                self.buf
+                    .extend_ssh_mpint(&primes.get(1).ok_or(Error::IndexOutOfBounds)?.to_bytes_be());
+                self.buf.extend_ssh_string(b"");
+            }
         }
         if !constraints.is_empty() {
             for cons in constraints {
@@ -272,6 +299,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
                             hash: SignatureHash::SHA2_512,
                         })
                     }
+                    #[cfg(not(feature = "openssl"))]
+                    b"ssh-rsa" => {
+                        let e = r.read_mpint()?;
+                        let n = r.read_mpint()?;
+                        use rsa::{RsaPublicKey, BigUint};
+
+                        let e = BigUint::from_bytes_be(&e);
+                        let n = BigUint::from_bytes_be(&n);
+
+                        keys.push(PublicKey::RSA {
+                            key: RsaPublicKey::new(n, e)?,
+                            hash: SignatureHash::SHA2_512,
+                        })
+                    }
                     b"ssh-ed25519" => keys.push(PublicKey::Ed25519(
                         ed25519_dalek::VerifyingKey::try_from(r.read_string()?)?,
                     )),
@@ -346,7 +387,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
         self.buf.extend_ssh_string(data);
         debug!("public = {:?}", public);
         let hash = match public {
-            #[cfg(feature = "openssl")]
             PublicKey::RSA { hash, .. } => match hash {
                 SignatureHash::SHA2_256 => 2,
                 SignatureHash::SHA2_512 => 4,
@@ -529,14 +569,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AgentClient<S> {
 
 fn key_blob(public: &key::PublicKey, buf: &mut CryptoVec) -> Result<(), Error> {
     match *public {
-        #[cfg(feature = "openssl")]
         PublicKey::RSA { ref key, .. } => {
             buf.extend(&[0, 0, 0, 0]);
             let len0 = buf.len();
             buf.extend_ssh_string(b"ssh-rsa");
-            let rsa = key.0.rsa()?;
-            buf.extend_ssh_mpint(&rsa.e().to_vec());
-            buf.extend_ssh_mpint(&rsa.n().to_vec());
+            #[cfg(feature = "openssl")]
+            {
+                let rsa = key.0.rsa()?;
+                buf.extend_ssh_mpint(&rsa.e().to_vec());
+                buf.extend_ssh_mpint(&rsa.n().to_vec());
+            }
+            #[cfg(not(feature = "openssl"))]
+            {
+                let rsa = key.clone();
+                buf.extend_ssh_mpint(&rsa.e().to_bytes_be());
+                buf.extend_ssh_mpint(&rsa.n().to_bytes_be());
+            }
+
             let len1 = buf.len();
             #[allow(clippy::indexing_slicing)] // length is known
             BigEndian::write_u32(&mut buf[5..], (len1 - len0) as u32);
