@@ -74,9 +74,9 @@ static _HMAC_SHA256: CryptoMacAlgorithm<Hmac<Sha256>, U32> =
     CryptoMacAlgorithm(PhantomData, PhantomData);
 static _HMAC_SHA512: CryptoMacAlgorithm<Hmac<Sha512>, U64> =
     CryptoMacAlgorithm(PhantomData, PhantomData);
-static _HMAC_SHA1_ETM: CryptoEtmMacAlgorithm<Hmac<Sha1>, U64> =
+static _HMAC_SHA1_ETM: CryptoEtmMacAlgorithm<Hmac<Sha1>, U20> =
     CryptoEtmMacAlgorithm(PhantomData, PhantomData);
-static _HMAC_SHA256_ETM: CryptoEtmMacAlgorithm<Hmac<Sha256>, U64> =
+static _HMAC_SHA256_ETM: CryptoEtmMacAlgorithm<Hmac<Sha256>, U32> =
     CryptoEtmMacAlgorithm(PhantomData, PhantomData);
 static _HMAC_SHA512_ETM: CryptoEtmMacAlgorithm<Hmac<Sha512>, U64> =
     CryptoEtmMacAlgorithm(PhantomData, PhantomData);

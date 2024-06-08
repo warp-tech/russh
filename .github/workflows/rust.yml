@@ -2,9 +2,9 @@ name: Rust
 
 on:
   push:
-    branches: [ master ]
+    branches: [ main ]
   pull_request:
-    branches: [ master ]
+    branches: [ main ]
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,6 +26,18 @@ jobs:
       uses: obi1kenobi/cargo-semver-checks-action@v2
       with:
         package: russh
+
+  Formatting:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Install rustfmt
+      run: rustup component add rustfmt
+
+    - name: rustfmt
+      run: cargo fmt --check
 
   Clippy:
     runs-on: ubuntu-latest

@@ -3,14 +3,14 @@ authors = ["Pierre-Étienne Meunier <pe@pijul.org>"]
 description = "A client and server SSH library."
 documentation = "https://docs.rs/russh"
 edition = "2018"
-homepage = "https://pijul.org/russh"
+homepage = "https://github.com/warp-tech/russh"
 keywords = ["ssh"]
 license = "Apache-2.0"
 name = "russh"
 readme = "../README.md"
 repository = "https://github.com/warp-tech/russh"
-version = "0.38.0-beta.1"
-rust-version = "1.60"
+version = "0.44.0-beta.2"
+rust-version = "1.65"
 
 [features]
 default = ["flate2"]
@@ -18,33 +18,41 @@ openssl = ["russh-keys/openssl", "dep:openssl"]
 vendored-openssl = ["openssl/vendored", "russh-keys/vendored-openssl"]
 
 [dependencies]
-aes = "0.8"
+aes = { workspace = true }
 aes-gcm = "0.10"
-async-trait = "0.1"
+cbc = { version = "0.1" }
+async-trait = { workspace = true }
 bitflags = "2.0"
-byteorder = "1.3"
+byteorder = { workspace = true }
 chacha20 = "0.9"
-curve25519-dalek = "4.0"
-poly1305 = "0.8"
 ctr = "0.9"
-digest = "0.10"
+curve25519-dalek = "4.1.2"
+digest = { workspace = true }
+elliptic-curve = { version = "0.13", features = ["ecdh"] }
 flate2 = { version = "1.0", optional = true }
-futures = "0.3"
+futures = { workspace = true }
 generic-array = "0.14"
-hmac = "0.12"
-log = "0.4"
-once_cell = "1.13"
-openssl = { version = "0.10", optional = true }
-rand = "0.8"
-russh-cryptovec = { version = "0.7.0", path = "../cryptovec" }
-russh-keys = { version = "0.37.1", path = "../russh-keys" }
-sha1 = "0.10"
-sha2 = "0.10"
 hex-literal = "0.4"
+hmac = { workspace = true }
+log = { workspace = true }
 num-bigint = { version = "0.4", features = ["rand"] }
+once_cell = "1.13"
+openssl = { workspace = true, optional = true }
+p256 = { version = "0.13", features = ["ecdh"] }
+p384 = { version = "0.13", features = ["ecdh"] }
+p521 = { version = "0.13", features = ["ecdh"] }
+poly1305 = "0.8"
+rand = { workspace = true }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+russh-cryptovec = { version = "0.7.0", path = "../cryptovec" }
+russh-keys = { version = "0.44.0-beta.2", path = "../russh-keys" }
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+ssh-encoding = { workspace = true }
+ssh-key = { workspace = true }
 subtle = "2.4"
-thiserror = "1.0"
-tokio = { version = "1.17.0", features = [
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
     "io-util",
     "rt-multi-thread",
     "time",
@@ -53,12 +61,13 @@ tokio = { version = "1.17.0", features = [
     "macros",
     "process",
 ] }
-tokio-util = "0.7"
 
 [dev-dependencies]
 anyhow = "1.0"
 env_logger = "0.10"
+clap = { version = "3.2", features = ["derive"] }
 tokio = { version = "1.17.0", features = [
+    "io-std",
     "io-util",
     "rt-multi-thread",
     "time",
@@ -66,7 +75,12 @@ tokio = { version = "1.17.0", features = [
     "sync",
     "macros",
 ] }
-russh-sftp = "1.1"
+russh-sftp = "2.0.0-beta.2"
+rand = "0.8.5"
+shell-escape = "0.1"
+tokio-fd = "0.3"
+termion = "2"
+ratatui = "0.26.0"
 
 [package.metadata.docs.rs]
 features = ["openssl"]

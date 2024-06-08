@@ -15,8 +15,6 @@ use {std, tokio};
 
 use super::{msg, Constraint};
 use crate::encoding::{Encoding, Position, Reader};
-#[cfg(feature = "openssl")]
-use crate::key::SignatureHash;
 use crate::{key, Error};
 
 #[derive(Clone)]
@@ -252,82 +250,27 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
         constrained: bool,
         writebuf: &mut CryptoVec,
     ) -> Result<bool, Error> {
-        let pos0 = r.position;
-        let t = r.read_string()?;
-        let (blob, key) = match t {
-            b"ssh-ed25519" => {
-                let pos1 = r.position;
-                let concat = r.read_string()?;
-                let _comment = r.read_string()?;
-                #[allow(clippy::indexing_slicing)] // length checked before
-                let secret = ed25519_dalek::SigningKey::try_from(
-                    concat.get(..32).ok_or(Error::KeyIsCorrupt)?,
-                ).map_err(|_| Error::KeyIsCorrupt)?;
+        let (blob, key_pair) = {
+            use ssh_encoding::{Decode, Encode};
 
-                writebuf.push(msg::SUCCESS);
+            let private_key = ssh_key::private::PrivateKey::new(
+                ssh_key::private::KeypairData::decode(&mut r)?,
+                "",
+            )?;
+            let _comment = r.read_string()?;
+            let key_pair = key::KeyPair::try_from(&private_key)?;
 
-                #[allow(clippy::indexing_slicing)] // positions checked before
-                (self.buf[pos0..pos1].to_vec(), key::KeyPair::Ed25519(secret))
-            }
-            #[cfg(feature = "openssl")]
-            b"ssh-rsa" => {
-                use openssl::bn::{BigNum, BigNumContext};
-                use openssl::rsa::Rsa;
-                let n = r.read_mpint()?;
-                let e = r.read_mpint()?;
-                let d = BigNum::from_slice(r.read_mpint()?)?;
-                let q_inv = r.read_mpint()?;
-                let p = BigNum::from_slice(r.read_mpint()?)?;
-                let q = BigNum::from_slice(r.read_mpint()?)?;
-                let (dp, dq) = {
-                    let one = BigNum::from_u32(1)?;
-                    let p1 = p.as_ref() - one.as_ref();
-                    let q1 = q.as_ref() - one.as_ref();
-                    let mut context = BigNumContext::new()?;
-                    let mut dp = BigNum::new()?;
-                    let mut dq = BigNum::new()?;
-                    dp.checked_rem(&d, &p1, &mut context)?;
-                    dq.checked_rem(&d, &q1, &mut context)?;
-                    (dp, dq)
-                };
-                let _comment = r.read_string()?;
-                let key = Rsa::from_private_components(
-                    BigNum::from_slice(n)?,
-                    BigNum::from_slice(e)?,
-                    d,
-                    p,
-                    q,
-                    dp,
-                    dq,
-                    BigNum::from_slice(q_inv)?,
-                )?;
+            let mut blob = Vec::new();
+            private_key.public_key().key_data().encode(&mut blob)?;
 
-                let len0 = writebuf.len();
-                writebuf.extend_ssh_string(b"ssh-rsa");
-                writebuf.extend_ssh_mpint(e);
-                writebuf.extend_ssh_mpint(n);
-
-                #[allow(clippy::indexing_slicing)] // length is known
-                let blob = writebuf[len0..].to_vec();
-                writebuf.resize(len0);
-                writebuf.push(msg::SUCCESS);
-                (
-                    blob,
-                    key::KeyPair::RSA {
-                        key,
-                        hash: SignatureHash::SHA2_256,
-                    },
-                )
-            }
-            _ => return Ok(false),
+            (blob, key_pair)
         };
+        writebuf.push(msg::SUCCESS);
         let mut w = self.keys.0.write().or(Err(Error::AgentFailure))?;
         let now = SystemTime::now();
         if constrained {
-            let n = r.read_u32()?;
             let mut c = Vec::new();
-            for _ in 0..n {
-                let t = r.read_byte()?;
+            while let Ok(t) = r.read_byte() {
                 if t == msg::CONSTRAIN_LIFETIME {
                     let seconds = r.read_u32()?;
                     c.push(Constraint::KeyLifetime { seconds });
@@ -352,9 +295,9 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
                     return Ok(false);
                 }
             }
-            w.insert(blob, (Arc::new(key), now, Vec::new()));
+            w.insert(blob, (Arc::new(key_pair), now, c));
         } else {
-            w.insert(blob, (Arc::new(key), now, Vec::new()));
+            w.insert(blob, (Arc::new(key_pair), now, Vec::new()));
         }
         Ok(true)
     }
@@ -369,7 +312,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
         let key = {
             let blob = r.read_string()?;
             let k = self.keys.0.read().or(Err(Error::AgentFailure))?;
-            if let Some(&(ref key, _, ref constraints)) = k.get(blob) {
+            if let Some((key, _, constraints)) = k.get(blob) {
                 if constraints.iter().any(|c| *c == Constraint::Confirm) {
                     needs_confirm = true;
                 }

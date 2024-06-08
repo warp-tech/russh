@@ -1,8 +1,20 @@
-use russh_cryptovec::CryptoVec;
-use tokio::sync::mpsc::{Sender, UnboundedReceiver};
-use log::debug;
+use std::{pin::Pin, sync::Arc};
 
-use crate::{ChannelId, ChannelOpenFailure, ChannelStream, Error, Pty, Sig};
+use futures::{Future, FutureExt as _};
+use russh_cryptovec::CryptoVec;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc::{Sender, UnboundedReceiver};
+use tokio::sync::Mutex;
+
+use crate::{ChannelId, ChannelOpenFailure, Error, Pty, Sig};
+
+pub mod io;
+
+mod channel_ref;
+pub use channel_ref::ChannelRef;
+
+mod channel_stream;
+pub use channel_stream::ChannelStream;
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -21,6 +33,7 @@ pub enum ChannelMsg {
         ext: u32,
     },
     Eof,
+    Close,
     /// (client only)
     RequestPty {
         want_reply: bool,
@@ -98,8 +111,6 @@ pub enum ChannelMsg {
     Success,
     /// (server only)
     Failure,
-    /// (server only)
-    Close,
     OpenFailure(ChannelOpenFailure),
 }
 
@@ -111,7 +122,7 @@ pub struct Channel<Send: From<(ChannelId, ChannelMsg)>> {
     pub(crate) sender: Sender<Send>,
     pub(crate) receiver: UnboundedReceiver<ChannelMsg>,
     pub(crate) max_packet_size: u32,
-    pub(crate) window_size: u32,
+    pub(crate) window_size: Arc<Mutex<u32>>,
 }
 
 impl<T: From<(ChannelId, ChannelMsg)>> std::fmt::Debug for Channel<T> {
@@ -120,21 +131,45 @@ impl<T: From<(ChannelId, ChannelMsg)>> std::fmt::Debug for Channel<T> {
     }
 }
 
-impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> Channel<S> {
-    pub fn id(&self) -> ChannelId {
-        self.id
+impl<S: From<(ChannelId, ChannelMsg)> + Send + Sync + 'static> Channel<S> {
+    pub(crate) fn new(
+        id: ChannelId,
+        sender: Sender<S>,
+        max_packet_size: u32,
+        window_size: u32,
+    ) -> (Self, ChannelRef) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let window_size = Arc::new(Mutex::new(window_size));
+
+        (
+            Self {
+                id,
+                sender,
+                receiver: rx,
+                max_packet_size,
+                window_size: window_size.clone(),
+            },
+            ChannelRef {
+                sender: tx,
+                window_size,
+            },
+        )
     }
 
     /// Returns the min between the maximum packet size and the
     /// remaining window size in the channel.
-    pub fn writable_packet_size(&self) -> usize {
-        self.max_packet_size.min(self.window_size) as usize
+    pub async fn writable_packet_size(&self) -> usize {
+        self.max_packet_size.min(*self.window_size.lock().await) as usize
+    }
+
+    pub fn id(&self) -> ChannelId {
+        self.id
     }
 
     /// Request a pseudo-terminal with the given characteristics.
     #[allow(clippy::too_many_arguments)] // length checked
     pub async fn request_pty(
-        &mut self,
+        &self,
         want_reply: bool,
         term: &str,
         col_width: u32,
@@ -152,42 +187,33 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> Channel<S> {
             pix_height,
             terminal_modes: terminal_modes.to_vec(),
         })
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Request a remote shell.
-    pub async fn request_shell(&mut self, want_reply: bool) -> Result<(), Error> {
-        self.send_msg(ChannelMsg::RequestShell { want_reply })
-            .await?;
-        Ok(())
+    pub async fn request_shell(&self, want_reply: bool) -> Result<(), Error> {
+        self.send_msg(ChannelMsg::RequestShell { want_reply }).await
     }
 
     /// Execute a remote program (will be passed to a shell). This can
     /// be used to implement scp (by calling a remote scp and
     /// tunneling to its standard input).
-    pub async fn exec<A: Into<Vec<u8>>>(
-        &mut self,
-        want_reply: bool,
-        command: A,
-    ) -> Result<(), Error> {
+    pub async fn exec<A: Into<Vec<u8>>>(&self, want_reply: bool, command: A) -> Result<(), Error> {
         self.send_msg(ChannelMsg::Exec {
             want_reply,
             command: command.into(),
         })
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Signal a remote process.
-    pub async fn signal(&mut self, signal: Sig) -> Result<(), Error> {
-        self.send_msg(ChannelMsg::Signal { signal }).await?;
-        Ok(())
+    pub async fn signal(&self, signal: Sig) -> Result<(), Error> {
+        self.send_msg(ChannelMsg::Signal { signal }).await
     }
 
     /// Request the start of a subsystem with the given name.
     pub async fn request_subsystem<A: Into<String>>(
-        &mut self,
+        &self,
         want_reply: bool,
         name: A,
     ) -> Result<(), Error> {
@@ -195,8 +221,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> Channel<S> {
             want_reply,
             name: name.into(),
         })
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Request X11 forwarding through an already opened X11
@@ -204,7 +229,7 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> Channel<S> {
     /// [RFC4254](https://tools.ietf.org/html/rfc4254#section-6.3.1)
     /// for security issues related to cookies.
     pub async fn request_x11<A: Into<String>, B: Into<String>>(
-        &mut self,
+        &self,
         want_reply: bool,
         single_connection: bool,
         x11_authentication_protocol: A,
@@ -218,13 +243,12 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> Channel<S> {
             x11_authentication_cookie: x11_authentication_cookie.into(),
             x11_screen_number,
         })
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Set a remote environment variable.
     pub async fn set_env<A: Into<String>, B: Into<String>>(
-        &mut self,
+        &self,
         want_reply: bool,
         variable_name: A,
         variable_value: B,
@@ -234,13 +258,12 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> Channel<S> {
             variable_name: variable_name.into(),
             variable_value: variable_value.into(),
         })
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Inform the server that our window size has changed.
     pub async fn window_change(
-        &mut self,
+        &self,
         col_width: u32,
         row_height: u32,
         pix_width: u32,
@@ -252,107 +275,68 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> Channel<S> {
             pix_width,
             pix_height,
         })
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Inform the server that we will accept agent forwarding channels
-    pub async fn agent_forward(&mut self, want_reply: bool) -> Result<(), Error> {
-        self.send_msg(ChannelMsg::AgentForward { want_reply })
-            .await?;
-        Ok(())
+    pub async fn agent_forward(&self, want_reply: bool) -> Result<(), Error> {
+        self.send_msg(ChannelMsg::AgentForward { want_reply }).await
     }
 
     /// Send data to a channel.
-    pub async fn data<R: tokio::io::AsyncReadExt + Unpin>(&mut self, data: R) -> Result<(), Error> {
+    pub async fn data<R: tokio::io::AsyncRead + Unpin>(&self, data: R) -> Result<(), Error> {
         self.send_data(None, data).await
     }
 
     /// Send data to a channel. The number of bytes added to the
     /// "sending pipeline" (to be processed by the event loop) is
     /// returned.
-    pub async fn extended_data<R: tokio::io::AsyncReadExt + Unpin>(
-        &mut self,
+    pub async fn extended_data<R: tokio::io::AsyncRead + Unpin>(
+        &self,
         ext: u32,
         data: R,
     ) -> Result<(), Error> {
         self.send_data(Some(ext), data).await
     }
 
-    async fn send_data<R: tokio::io::AsyncReadExt + Unpin>(
-        &mut self,
+    async fn send_data<R: tokio::io::AsyncRead + Unpin>(
+        &self,
         ext: Option<u32>,
         mut data: R,
     ) -> Result<(), Error> {
-        let mut total = 0;
-        loop {
-            // wait for the window to be restored.
-            while self.window_size == 0 {
-                match self.receiver.recv().await {
-                    Some(ChannelMsg::WindowAdjusted { new_size }) => {
-                        debug!("window adjusted: {:?}", new_size);
-                        self.window_size = new_size;
-                        break;
-                    }
-                    Some(msg) => {
-                        debug!("unexpected channel msg: {:?}", msg);
-                    }
-                    None => break,
-                }
-            }
-            debug!(
-                "sending data, self.window_size = {:?}, self.max_packet_size = {:?}, total = {:?}",
-                self.window_size, self.max_packet_size, total
-            );
-            let sendable = self.window_size.min(self.max_packet_size) as usize;
+        let mut tx = self.make_writer_ext(ext);
 
-            debug!("sendable {:?}", sendable);
+        tokio::io::copy(&mut data, &mut tx).await?;
 
-            // If we can not send anymore, continue
-            // and wait for server window adjustment
-            if sendable == 0 {
-                continue;
-            }
-
-            let mut c = CryptoVec::new_zeroed(sendable);
-            let n = data.read(&mut c[..]).await?;
-            total += n;
-            c.resize(n);
-            self.window_size -= n as u32;
-            self.send_data_packet(ext, c).await?;
-            if n == 0 {
-                break;
-            } else if self.window_size > 0 {
-                continue;
-            }
-        }
         Ok(())
     }
 
-    async fn send_data_packet(&mut self, ext: Option<u32>, data: CryptoVec) -> Result<(), Error> {
-        self.send_msg(if let Some(ext) = ext {
-            ChannelMsg::ExtendedData { ext, data }
-        } else {
-            ChannelMsg::Data { data }
-        })
-        .await?;
-        Ok(())
+    pub async fn eof(&self) -> Result<(), Error> {
+        self.send_msg(ChannelMsg::Eof).await
     }
 
-    pub async fn eof(&mut self) -> Result<(), Error> {
-        self.send_msg(ChannelMsg::Eof).await?;
-        Ok(())
+    /// Request that the channel be closed.
+    pub async fn close(&self) -> Result<(), Error> {
+        self.send_msg(ChannelMsg::Close).await
     }
+    /// Get a `FnOnce` that can be used to send a signal through this channel
+    pub fn get_signal_sender(
+        &self,
+    ) -> impl FnOnce(Sig) -> Pin<Box<dyn Future<Output = Result<(), Error>> + std::marker::Send>>
+    {
+        let sender = self.sender.clone();
+        let id = self.id;
 
-    /// Wait for data to come.
-    pub async fn wait(&mut self) -> Option<ChannelMsg> {
-        match self.receiver.recv().await {
-            Some(ChannelMsg::WindowAdjusted { new_size }) => {
-                self.window_size = new_size;
-                Some(ChannelMsg::WindowAdjusted { new_size })
+        move |signal| {
+            async move {
+                sender
+                    .send((id, ChannelMsg::Signal { signal }).into())
+                    .await
+                    .map_err(|_| Error::SendError)?;
+
+                Ok(())
             }
-            Some(msg) => Some(msg),
-            None => None,
+            .boxed()
         }
     }
 
@@ -363,51 +347,53 @@ impl<S: From<(ChannelId, ChannelMsg)> + Send + 'static> Channel<S> {
             .map_err(|_| Error::SendError)
     }
 
-    /// Request that the channel be closed.
-    pub async fn close(&self) -> Result<(), Error> {
-        self.send_msg(ChannelMsg::Close).await?;
-        Ok(())
+    /// Awaits an incoming [`ChannelMsg`], this method returns [`None`] if the channel has been closed.
+    pub async fn wait(&mut self) -> Option<ChannelMsg> {
+        self.receiver.recv().await
     }
 
-    pub fn into_stream(mut self) -> ChannelStream {
-        let (stream, mut r_rx, w_tx) = ChannelStream::new();
+    /// Consume the [`Channel`] to produce a bidirectionnal stream,
+    /// sending and receiving [`ChannelMsg::Data`] as `AsyncRead` + `AsyncWrite`.
+    pub fn into_stream(self) -> ChannelStream<S> {
+        ChannelStream::new(
+            io::ChannelTx::new(
+                self.sender.clone(),
+                self.id,
+                self.window_size.clone(),
+                self.max_packet_size,
+                None,
+            ),
+            io::ChannelRx::new(self, None),
+        )
+    }
 
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    data = r_rx.recv() => {
-                        match data {
-                            Some(data) if !data.is_empty() => self.data(&data[..]).await?,
-                            Some(_) => {
-                                log::debug!("closing chan {:?}, received empty data", &self.id);
-                                self.eof().await?;
-                                self.close().await?;
-                                break;
-                            },
-                            None => {
-                                self.close().await?;
-                                break
-                            }
-                        }
-                    },
-                    msg = self.wait() => {
-                        match msg {
-                            Some(ChannelMsg::Data { data }) => {
-                                w_tx.send(data[..].into()).map_err(|_| crate::Error::SendError)?;
-                            }
-                            Some(ChannelMsg::Eof) => {
-                                // Send a 0-length chunk to indicate EOF.
-                                w_tx.send("".into()).map_err(|_| crate::Error::SendError)?;
-                                break
-                            }
-                            None => break,
-                            _ => (),
-                        }
-                    }
-                }
-            }
-            Ok::<_, crate::Error>(())
-        });
-        stream
+    /// Make a reader for the [`Channel`] to receive [`ChannelMsg::Data`]
+    /// through the `AsyncRead` trait.
+    pub fn make_reader(&mut self) -> impl AsyncRead + '_ {
+        self.make_reader_ext(None)
+    }
+
+    /// Make a reader for the [`Channel`] to receive [`ChannelMsg::Data`] or [`ChannelMsg::ExtendedData`]
+    /// depending on the `ext` parameter, through the `AsyncRead` trait.
+    pub fn make_reader_ext(&mut self, ext: Option<u32>) -> impl AsyncRead + '_ {
+        io::ChannelRx::new(self, ext)
+    }
+
+    /// Make a writer for the [`Channel`] to send [`ChannelMsg::Data`]
+    /// through the `AsyncWrite` trait.
+    pub fn make_writer(&self) -> impl AsyncWrite {
+        self.make_writer_ext(None)
+    }
+
+    /// Make a writer for the [`Channel`] to send [`ChannelMsg::Data`] or [`ChannelMsg::ExtendedData`]
+    /// depending on the `ext` parameter, through the `AsyncWrite` trait.
+    pub fn make_writer_ext(&self, ext: Option<u32>) -> impl AsyncWrite {
+        io::ChannelTx::new(
+            self.sender.clone(),
+            self.id,
+            self.window_size.clone(),
+            self.max_packet_size,
+            ext,
+        )
     }
 }

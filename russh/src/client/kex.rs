@@ -21,7 +21,7 @@ impl KexInit {
             // read algorithms from packet.
             debug!("extending {:?}", &self.exchange.server_kex_init[..]);
             self.exchange.server_kex_init.extend(buf);
-            negotiation::Client::read_kex(buf, &config.preferred)?
+            negotiation::Client::read_kex(buf, &config.preferred, None)?
         };
         debug!("algo = {:?}", algo);
         debug!("write = {:?}", &write_buffer.buffer[..]);
@@ -69,7 +69,7 @@ impl KexInit {
         write_buffer: &mut SSHBuffer,
     ) -> Result<(), crate::Error> {
         self.exchange.client_kex_init.clear();
-        negotiation::write_kex(&config.preferred, &mut self.exchange.client_kex_init, false)?;
+        negotiation::write_kex(&config.preferred, &mut self.exchange.client_kex_init, None)?;
         self.sent = true;
         cipher.write(&self.exchange.client_kex_init, write_buffer);
         Ok(())

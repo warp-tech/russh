@@ -17,14 +17,18 @@
 //! This module exports kex algorithm names for use with [Preferred].
 mod curve25519;
 mod dh;
+mod ecdh_nistp;
 mod none;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Debug;
 
 use curve25519::Curve25519KexType;
-use dh::{DhGroup14Sha1KexType, DhGroup14Sha256KexType, DhGroup1Sha1KexType};
+use dh::{
+    DhGroup14Sha1KexType, DhGroup14Sha256KexType, DhGroup16Sha512KexType, DhGroup1Sha1KexType,
+};
 use digest::Digest;
+use ecdh_nistp::{EcdhNistP256KexType, EcdhNistP384KexType, EcdhNistP521KexType};
 use once_cell::sync::Lazy;
 use russh_cryptovec::CryptoVec;
 use russh_keys::encoding::Encoding;
@@ -93,17 +97,33 @@ pub const DH_G1_SHA1: Name = Name("diffie-hellman-group1-sha1");
 pub const DH_G14_SHA1: Name = Name("diffie-hellman-group14-sha1");
 /// `diffie-hellman-group14-sha256`
 pub const DH_G14_SHA256: Name = Name("diffie-hellman-group14-sha256");
+/// `diffie-hellman-group16-sha512`
+pub const DH_G16_SHA512: Name = Name("diffie-hellman-group16-sha512");
+/// `ecdh-sha2-nistp256`
+pub const ECDH_SHA2_NISTP256: Name = Name("ecdh-sha2-nistp256");
+/// `ecdh-sha2-nistp384`
+pub const ECDH_SHA2_NISTP384: Name = Name("ecdh-sha2-nistp384");
+/// `ecdh-sha2-nistp521`
+pub const ECDH_SHA2_NISTP521: Name = Name("ecdh-sha2-nistp521");
 /// `none`
 pub const NONE: Name = Name("none");
 /// `ext-info-c`
 pub const EXTENSION_SUPPORT_AS_CLIENT: Name = Name("ext-info-c");
 /// `ext-info-s`
 pub const EXTENSION_SUPPORT_AS_SERVER: Name = Name("ext-info-s");
+/// `kex-strict-c-v00@openssh.com`
+pub const EXTENSION_OPENSSH_STRICT_KEX_AS_CLIENT: Name = Name("kex-strict-c-v00@openssh.com");
+/// `kex-strict-s-v00@openssh.com`
+pub const EXTENSION_OPENSSH_STRICT_KEX_AS_SERVER: Name = Name("kex-strict-s-v00@openssh.com");
 
 const _CURVE25519: Curve25519KexType = Curve25519KexType {};
 const _DH_G1_SHA1: DhGroup1Sha1KexType = DhGroup1Sha1KexType {};
 const _DH_G14_SHA1: DhGroup14Sha1KexType = DhGroup14Sha1KexType {};
 const _DH_G14_SHA256: DhGroup14Sha256KexType = DhGroup14Sha256KexType {};
+const _DH_G16_SHA512: DhGroup16Sha512KexType = DhGroup16Sha512KexType {};
+const _ECDH_SHA2_NISTP256: EcdhNistP256KexType = EcdhNistP256KexType {};
+const _ECDH_SHA2_NISTP384: EcdhNistP384KexType = EcdhNistP384KexType {};
+const _ECDH_SHA2_NISTP521: EcdhNistP521KexType = EcdhNistP521KexType {};
 const _NONE: none::NoneKexType = none::NoneKexType {};
 
 pub(crate) static KEXES: Lazy<HashMap<&'static Name, &(dyn KexType + Send + Sync)>> =
@@ -111,9 +131,13 @@ pub(crate) static KEXES: Lazy<HashMap<&'static Name, &(dyn KexType + Send + Sync
         let mut h: HashMap<&'static Name, &(dyn KexType + Send + Sync)> = HashMap::new();
         h.insert(&CURVE25519, &_CURVE25519);
         h.insert(&CURVE25519_PRE_RFC_8731, &_CURVE25519);
+        h.insert(&DH_G16_SHA512, &_DH_G16_SHA512);
         h.insert(&DH_G14_SHA256, &_DH_G14_SHA256);
         h.insert(&DH_G14_SHA1, &_DH_G14_SHA1);
         h.insert(&DH_G1_SHA1, &_DH_G1_SHA1);
+        h.insert(&ECDH_SHA2_NISTP256, &_ECDH_SHA2_NISTP256);
+        h.insert(&ECDH_SHA2_NISTP384, &_ECDH_SHA2_NISTP384);
+        h.insert(&ECDH_SHA2_NISTP521, &_ECDH_SHA2_NISTP521);
         h.insert(&NONE, &_NONE);
         h
     });

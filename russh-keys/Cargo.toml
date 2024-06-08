@@ -11,57 +11,77 @@ include = [
   "src/agent/msg.rs",
   "src/agent/server.rs",
   "src/agent/client.rs",
+  "src/backend_openssl.rs",
+  "src/backend_rust.rs",
   "src/bcrypt_pbkdf.rs",
   "src/blowfish.rs",
+  "src/ec.rs",
   "src/encoding.rs",
   "src/format/mod.rs",
   "src/format/openssh.rs",
   "src/format/pkcs5.rs",
   "src/format/pkcs8.rs",
   "src/key.rs",
+  "src/protocol.rs",
   "src/signature.rs",
 ]
 keywords = ["ssh"]
 license = "Apache-2.0"
 name = "russh-keys"
 repository = "https://github.com/warp-tech/russh"
-version = "0.37.1"
+version = "0.44.0-beta.2"
+rust-version = "1.65"
 
 [dependencies]
-aes = "0.8"
-async-trait = "0.1.72"
+aes = { workspace = true }
+async-trait = { workspace = true }
 bcrypt-pbkdf = "0.10"
-bit-vec = "0.6"
 cbc = "0.1"
 ctr = "0.9"
 block-padding = { version = "0.3", features = ["std"] }
-byteorder = "1.4"
+byteorder = { workspace = true }
 data-encoding = "2.3"
+digest = { workspace = true }
+der = "0.7"
 dirs = "5.0"
-ed25519-dalek = { version= "2.0", features = ["rand_core"] }
-futures = "0.3"
-hmac = "0.12"
+ecdsa = "0.16"
+ed25519-dalek = { version = "2.0", features = ["rand_core", "pkcs8"] }
+elliptic-curve = "0.13"
+futures = { workspace = true }
+hmac = { workspace = true }
 inout = { version = "0.1", features = ["std"] }
-log = "0.4"
+log = { workspace = true }
 md5 = "0.7"
-num-bigint = "0.4"
 num-integer = "0.1"
-openssl = { version = "0.10", optional = true }
+openssl = { workspace = true, optional = true }
+p256 = "0.13"
+p384 = "0.13"
+p521 = "0.13"
 pbkdf2 = "0.11"
-rand = "0.7"
+pkcs1 = "0.7"
+pkcs5 = "0.7"
+pkcs8 = { version = "0.10", features = ["pkcs5", "encryption"] }
+rand = { workspace = true }
 rand_core = { version = "0.6.4", features = ["std"] }
+rsa = "0.9"
 russh-cryptovec = { version = "0.7.0", path = "../cryptovec" }
+sec1 = { version = "0.7", features = ["pkcs8"] }
 serde = { version = "1.0", features = ["derive"] }
-sha2 = "0.10"
-thiserror = "1.0"
-tokio = { version = "1.17.0", features = [
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+spki = "0.7"
+ssh-encoding = { workspace = true }
+ssh-key = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
   "io-util",
   "rt-multi-thread",
   "time",
   "net",
 ] }
 tokio-stream = { version = "0.1", features = ["net"] }
-yasna = { version = "0.5.0", features = ["bit-vec", "num-bigint"] }
+typenum = "1.17"
+zeroize = "1.7"
 
 [features]
 vendored-openssl = ["openssl", "openssl/vendored"]
@@ -69,6 +89,7 @@ vendored-openssl = ["openssl", "openssl/vendored"]
 [dev-dependencies]
 env_logger = "0.10"
 tempdir = "0.3"
+tokio = { workspace = true, features = ["test-util", "macros", "process"] }
 
 [package.metadata.docs.rs]
 features = ["openssl"]

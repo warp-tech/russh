@@ -7,8 +7,11 @@ include = ["Cargo.toml", "src/lib.rs"]
 license = "Apache-2.0"
 name = "russh-cryptovec"
 repository = "https://github.com/warp-tech/russh"
-version = "0.7.0"
+version = "0.7.3"
+rust-version = "1.60"
 
 [dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
 winapi = {version = "0.3", features = ["basetsd", "minwindef", "memoryapi"]}

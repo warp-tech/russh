@@ -30,11 +30,6 @@
 //! * [Writing SSH clients - the `russh::client` module](client)
 //! * [Writing SSH servers - the `russh::server` module](server)
 //!
-//! # Important crate features
-//!
-//! * RSA key support is gated behind the `openssl` feature (disabled by default).
-//! * Enabling that and disabling the `rs-crypto` feature (enabled by default) will leave you with a very basic, but pure-OpenSSL RSA+AES cipherset.
-//!
 //! # Using non-socket IO / writing tunnels
 //!
 //! The easy way to implement SSH tunnels, like `ProxyCommand` for
@@ -94,11 +89,16 @@
 //! messages sent through a `server::Handle` are processed when there
 //! is no incoming packet to read.
 
+use std::convert::TryFrom;
 use std::fmt::{Debug, Display, Formatter};
 
-use thiserror::Error;
+use log::debug;
 use parsing::ChannelOpenConfirmation;
 pub use russh_cryptovec::CryptoVec;
+use thiserror::Error;
+
+#[cfg(test)]
+mod tests;
 
 mod auth;
 
@@ -109,6 +109,7 @@ pub mod kex;
 /// MAC algorithm names
 pub mod mac;
 
+mod cert;
 mod compression;
 mod key;
 mod msg;
@@ -139,10 +140,7 @@ macro_rules! push_packet {
 }
 
 mod channels;
-pub use channels::{Channel, ChannelMsg};
-
-mod channel_stream;
-pub use channel_stream::ChannelStream;
+pub use channels::{Channel, ChannelMsg, ChannelStream};
 
 mod parsing;
 mod session;
@@ -248,6 +246,14 @@ pub enum Error {
     #[error("Connection timeout")]
     ConnectionTimeout,
 
+    /// Keepalive timeout.
+    #[error("Keepalive timeout")]
+    KeepaliveTimeout,
+
+    /// Inactivity timeout.
+    #[error("Inactivity timeout")]
+    InactivityTimeout,
+
     /// Missing authentication method.
     #[error("No authentication method")]
     NoAuthMethod,
@@ -261,6 +267,9 @@ pub enum Error {
     #[error("Failed to decrypt a packet")]
     DecryptionError,
 
+    #[error("The request was rejected by the other party")]
+    RequestDenied,
+
     #[error(transparent)]
     Keys(#[from] russh_keys::Error),
 
@@ -271,9 +280,11 @@ pub enum Error {
     Utf8(#[from] std::str::Utf8Error),
 
     #[error(transparent)]
+    #[cfg(feature = "flate2")]
     Compress(#[from] flate2::CompressError),
 
     #[error(transparent)]
+    #[cfg(feature = "flate2")]
     Decompress(#[from] flate2::DecompressError),
 
     #[error(transparent)]
@@ -285,6 +296,23 @@ pub enum Error {
 
     #[error(transparent)]
     Elapsed(#[from] tokio::time::error::Elapsed),
+
+    #[error("Violation detected during strict key exchange, message {message_type} at seq no {sequence_number}")]
+    StrictKeyExchangeViolation {
+        message_type: u8,
+        sequence_number: usize,
+    },
+}
+
+pub(crate) fn strict_kex_violation(message_type: u8, sequence_number: usize) -> crate::Error {
+    debug!(
+        "strict kex violated at sequence no. {:?}, message type: {:?}",
+        sequence_number, message_type
+    );
+    crate::Error::StrictKeyExchangeViolation {
+        message_type,
+        sequence_number,
+    }
 }
 
 #[derive(Debug, Error)]
@@ -329,6 +357,7 @@ pub use auth::{AgentAuthError, MethodSet, Signer};
 
 /// A reason for disconnection.
 #[allow(missing_docs)] // This should be relatively self-explanatory.
+#[allow(clippy::manual_non_exhaustive)]
 #[derive(Debug)]
 pub enum Disconnect {
     HostNotAllowedToConnect = 1,
@@ -347,6 +376,31 @@ pub enum Disconnect {
     AuthCancelledByUser = 13,
     NoMoreAuthMethodsAvailable = 14,
     IllegalUserName = 15,
+}
+
+impl TryFrom<u32> for Disconnect {
+    type Error = crate::Error;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Ok(match value {
+            1 => Self::HostNotAllowedToConnect,
+            2 => Self::ProtocolError,
+            3 => Self::KeyExchangeFailed,
+            4 => Self::Reserved,
+            5 => Self::MACError,
+            6 => Self::CompressionError,
+            7 => Self::ServiceNotAvailable,
+            8 => Self::ProtocolVersionNotSupported,
+            9 => Self::HostKeyNotVerifiable,
+            10 => Self::ConnectionLost,
+            11 => Self::ByApplication,
+            12 => Self::TooManyConnections,
+            13 => Self::AuthCancelledByUser,
+            14 => Self::NoMoreAuthMethodsAvailable,
+            15 => Self::IllegalUserName,
+            _ => return Err(crate::Error::Inconsistent),
+        })
+    }
 }
 
 /// The type of signals that can be sent to a remote process. If you
@@ -432,7 +486,7 @@ impl ChannelOpenFailure {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
 /// The identifier of a channel.
 pub struct ChannelId(u32);
 
@@ -455,6 +509,8 @@ pub(crate) struct ChannelParams {
     pub confirmed: bool,
     wants_reply: bool,
     pending_data: std::collections::VecDeque<(CryptoVec, Option<u32>, usize)>,
+    pending_eof: bool,
+    pending_close: bool,
 }
 
 impl ChannelParams {
@@ -466,479 +522,12 @@ impl ChannelParams {
     }
 }
 
-#[cfg(test)]
-mod test_compress {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-
-    use async_trait::async_trait;
-    use log::debug;
-
-    use super::server::{Server as _, Session};
-    use super::*;
-    use crate::server::Msg;
-
-    #[tokio::test]
-    async fn compress_local_test() {
-        let _ = env_logger::try_init();
-
-        let client_key = russh_keys::key::KeyPair::generate_ed25519().unwrap();
-        let mut config = server::Config::default();
-        config.preferred = Preferred::COMPRESSED;
-        config.inactivity_timeout = None; // Some(std::time::Duration::from_secs(3));
-        config.auth_rejection_time = std::time::Duration::from_secs(3);
-        config
-            .keys
-            .push(russh_keys::key::KeyPair::generate_ed25519().unwrap());
-        let config = Arc::new(config);
-        let mut sh = Server {
-            clients: Arc::new(Mutex::new(HashMap::new())),
-            id: 0,
-        };
-
-        let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = socket.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let (socket, _) = socket.accept().await.unwrap();
-            let server = sh.new_client(socket.peer_addr().ok());
-            server::run_stream(config, socket, server).await.unwrap();
-        });
-
-        let mut config = client::Config::default();
-        config.preferred = Preferred::COMPRESSED;
-        let config = Arc::new(config);
-
-        dbg!(&addr);
-        let mut session = client::connect(config, addr, Client {}).await.unwrap();
-        let authenticated = session
-            .authenticate_publickey(
-                std::env::var("USER").unwrap_or("user".to_owned()),
-                Arc::new(client_key),
-            )
-            .await
-            .unwrap();
-        assert!(authenticated);
-        let mut channel = session.channel_open_session().await.unwrap();
-
-        let data = &b"Hello, world!"[..];
-        channel.data(data).await.unwrap();
-        let msg = channel.wait().await.unwrap();
-        match msg {
-            ChannelMsg::Data { data: msg_data } => {
-                assert_eq!(*data, *msg_data)
-            }
-            msg => panic!("Unexpected message {:?}", msg),
-        }
-    }
-
-    #[derive(Clone)]
-    struct Server {
-        clients: Arc<Mutex<HashMap<(usize, ChannelId), super::server::Handle>>>,
-        id: usize,
-    }
-
-    impl server::Server for Server {
-        type Handler = Self;
-        fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> Self {
-            let s = self.clone();
-            self.id += 1;
-            s
-        }
-    }
-
-    #[async_trait]
-    impl server::Handler for Server {
-        type Error = super::Error;
-
-        async fn channel_open_session(
-            self,
-            channel: Channel<Msg>,
-            session: Session,
-        ) -> Result<(Self, bool, Session), Self::Error> {
-            {
-                let mut clients = self.clients.lock().unwrap();
-                clients.insert((self.id, channel.id()), session.handle());
-            }
-            Ok((self, true, session))
-        }
-        async fn auth_publickey(
-            self,
-            _: &str,
-            _: &russh_keys::key::PublicKey,
-        ) -> Result<(Self, server::Auth), Self::Error> {
-            debug!("auth_publickey");
-            Ok((self, server::Auth::Accept))
-        }
-        async fn data(
-            self,
-            channel: ChannelId,
-            data: &[u8],
-            mut session: Session,
-        ) -> Result<(Self, Session), Self::Error> {
-            debug!("server data = {:?}", std::str::from_utf8(data));
-            session.data(channel, CryptoVec::from_slice(data));
-            Ok((self, session))
-        }
-    }
-
-    struct Client {}
-
-    #[async_trait]
-    impl client::Handler for Client {
-        type Error = super::Error;
-
-        async fn check_server_key(
-            self,
-            _server_public_key: &russh_keys::key::PublicKey,
-        ) -> Result<(Self, bool), Self::Error> {
-            // println!("check_server_key: {:?}", server_public_key);
-            Ok((self, true))
-        }
-    }
-}
-
-#[cfg(test)]
-use futures::Future;
-
-#[cfg(test)]
-async fn test_session<RC, RS, CH, SH, F1, F2>(
-    client_handler: CH,
-    server_handler: SH,
-    run_client: RC,
-    run_server: RS,
-) where
-    RC: FnOnce(crate::client::Handle<CH>) -> F1 + Send + Sync + 'static,
-    RS: FnOnce(crate::server::Handle) -> F2 + Send + Sync + 'static,
-    F1: Future<Output = crate::client::Handle<CH>> + Send + Sync + 'static,
-    F2: Future<Output = crate::server::Handle> + Send + Sync + 'static,
-    CH: crate::client::Handler + Send + Sync + 'static,
-    SH: crate::server::Handler + Send + Sync + 'static,
-{
-    use std::sync::Arc;
-
-    use crate::*;
-
-    let _ = env_logger::try_init();
-
-    let client_key = russh_keys::key::KeyPair::generate_ed25519().unwrap();
-    let mut config = server::Config::default();
-    config.inactivity_timeout = None;
-    config.auth_rejection_time = std::time::Duration::from_secs(3);
-    config
-        .keys
-        .push(russh_keys::key::KeyPair::generate_ed25519().unwrap());
-    let config = Arc::new(config);
-    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = socket.local_addr().unwrap();
-
-    #[derive(Clone)]
-    struct Server {}
-
-    let server_join = tokio::spawn(async move {
-        let (socket, _) = socket.accept().await.unwrap();
-
-        server::run_stream(config, socket, server_handler)
-            .await
-            .map_err(|_| ())
-            .unwrap()
-    });
-
-    let client_join = tokio::spawn(async move {
-        let config = Arc::new(client::Config::default());
-        let mut session = client::connect(config, addr, client_handler)
-            .await
-            .map_err(|_| ())
-            .unwrap();
-        let authenticated = session
-            .authenticate_publickey(
-                std::env::var("USER").unwrap_or("user".to_owned()),
-                Arc::new(client_key),
-            )
-            .await
-            .unwrap();
-        assert!(authenticated);
-        session
-    });
-
-    let (server_session, client_session) = tokio::join!(server_join, client_join);
-    let client_handle = tokio::spawn(run_client(client_session.unwrap()));
-    let server_handle = tokio::spawn(run_server(server_session.unwrap().handle()));
-
-    let (server_session, client_session) = tokio::join!(server_handle, client_handle);
-    drop(client_session);
-    drop(server_session);
-}
-
-#[cfg(test)]
-mod test_channels {
-    use async_trait::async_trait;
-    use russh_cryptovec::CryptoVec;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    use crate::server::Session;
-    use crate::{client, server, test_session, Channel, ChannelId, ChannelMsg};
-
-    #[tokio::test]
-    async fn test_server_channels() {
-        #[derive(Debug)]
-        struct Client {}
-
-        #[async_trait]
-        impl client::Handler for Client {
-            type Error = crate::Error;
-
-            async fn check_server_key(
-                self,
-                _server_public_key: &russh_keys::key::PublicKey,
-            ) -> Result<(Self, bool), Self::Error> {
-                Ok((self, true))
-            }
-
-            async fn data(
-                self,
-                channel: ChannelId,
-                data: &[u8],
-                mut session: client::Session,
-            ) -> Result<(Self, client::Session), Self::Error> {
-                assert_eq!(data, &b"hello world!"[..]);
-                session.data(channel, CryptoVec::from_slice(&b"hey there!"[..]));
-                Ok((self, session))
-            }
-        }
-
-        struct ServerHandle {
-            did_auth: Option<tokio::sync::oneshot::Sender<()>>,
-        }
-
-        impl ServerHandle {
-            fn get_auth_waiter(&mut self) -> tokio::sync::oneshot::Receiver<()> {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                self.did_auth = Some(tx);
-                rx
-            }
-        }
-
-        #[async_trait]
-        impl server::Handler for ServerHandle {
-            type Error = crate::Error;
-
-            async fn auth_publickey(
-                self,
-                _: &str,
-                _: &russh_keys::key::PublicKey,
-            ) -> Result<(Self, server::Auth), Self::Error> {
-                Ok((self, server::Auth::Accept))
-            }
-            async fn auth_succeeded(
-                mut self,
-                session: Session,
-            ) -> Result<(Self, Session), Self::Error> {
-                if let Some(a) = self.did_auth.take() {
-                    a.send(()).unwrap();
-                }
-                Ok((self, session))
-            }
-        }
-
-        let mut sh = ServerHandle { did_auth: None };
-        let a = sh.get_auth_waiter();
-        test_session(
-            Client {},
-            sh,
-            |c| async move { c },
-            |s| async move {
-                a.await.unwrap();
-                let mut ch = s.channel_open_session().await.unwrap();
-                ch.data(&b"hello world!"[..]).await.unwrap();
-
-                let msg = ch.wait().await.unwrap();
-                if let ChannelMsg::Data { data } = msg {
-                    assert_eq!(data.as_ref(), &b"hey there!"[..]);
-                } else {
-                    panic!("Unexpected message {:?}", msg);
-                }
-                s
-            },
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_channel_streams() {
-        #[derive(Debug)]
-        struct Client {}
-
-        #[async_trait]
-        impl client::Handler for Client {
-            type Error = crate::Error;
-
-            async fn check_server_key(
-                self,
-                _server_public_key: &russh_keys::key::PublicKey,
-            ) -> Result<(Self, bool), Self::Error> {
-                Ok((self, true))
-            }
-        }
-
-        struct ServerHandle {
-            channel: Option<tokio::sync::oneshot::Sender<Channel<server::Msg>>>,
-        }
-
-        impl ServerHandle {
-            fn get_channel_waiter(
-                &mut self,
-            ) -> tokio::sync::oneshot::Receiver<Channel<server::Msg>> {
-                let (tx, rx) = tokio::sync::oneshot::channel::<Channel<server::Msg>>();
-                self.channel = Some(tx);
-                rx
-            }
-        }
-
-        #[async_trait]
-        impl server::Handler for ServerHandle {
-            type Error = crate::Error;
-
-            async fn auth_publickey(
-                self,
-                _: &str,
-                _: &russh_keys::key::PublicKey,
-            ) -> Result<(Self, server::Auth), Self::Error> {
-                Ok((self, server::Auth::Accept))
-            }
-
-            async fn channel_open_session(
-                mut self,
-                channel: Channel<server::Msg>,
-                session: server::Session,
-            ) -> Result<(Self, bool, Session), Self::Error> {
-                if let Some(a) = self.channel.take() {
-                    println!("channel open session {:?}", a);
-                    a.send(channel).unwrap();
-                }
-                Ok((self, true, session))
-            }
-        }
-
-        let mut sh = ServerHandle { channel: None };
-        let scw = sh.get_channel_waiter();
-
-        test_session(
-            Client {},
-            sh,
-            |client| async move {
-                let ch = client.channel_open_session().await.unwrap();
-                let mut stream = ch.into_stream();
-                stream.write_all(&b"request"[..]).await.unwrap();
-
-                let mut buf = Vec::new();
-                stream.read_buf(&mut buf).await.unwrap();
-                assert_eq!(&buf, &b"response"[..]);
-
-                stream.write_all(&b"reply"[..]).await.unwrap();
-
-                client
-            },
-            |server| async move {
-                let channel = scw.await.unwrap();
-                let mut stream = channel.into_stream();
-
-                let mut buf = Vec::new();
-                stream.read_buf(&mut buf).await.unwrap();
-                assert_eq!(&buf, &b"request"[..]);
-
-                stream.write_all(&b"response"[..]).await.unwrap();
-
-                buf.clear();
-
-                stream.read_buf(&mut buf).await.unwrap();
-                assert_eq!(&buf, &b"reply"[..]);
-
-                server
-            },
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_channel_objects() {
-        #[derive(Debug)]
-        struct Client {}
-
-        #[async_trait]
-        impl client::Handler for Client {
-            type Error = crate::Error;
-
-            async fn check_server_key(
-                self,
-                _server_public_key: &russh_keys::key::PublicKey,
-            ) -> Result<(Self, bool), Self::Error> {
-                Ok((self, true))
-            }
-        }
-
-        struct ServerHandle {}
-
-        impl ServerHandle {}
-
-        #[async_trait]
-        impl server::Handler for ServerHandle {
-            type Error = crate::Error;
-
-            async fn auth_publickey(
-                self,
-                _: &str,
-                _: &russh_keys::key::PublicKey,
-            ) -> Result<(Self, server::Auth), Self::Error> {
-                Ok((self, server::Auth::Accept))
-            }
-
-            async fn channel_open_session(
-                self,
-                mut channel: Channel<server::Msg>,
-                session: Session,
-            ) -> Result<(Self, bool, Session), Self::Error> {
-                tokio::spawn(async move {
-                    while let Some(msg) = channel.wait().await {
-                        match msg {
-                            ChannelMsg::Data { data } => {
-                                channel.data(&data[..]).await.unwrap();
-                                channel.close().await.unwrap();
-                                break
-                            }
-                            _ => {}
-                        }
-                    }
-                });
-                Ok((self, true, session))
-            }
-        }
-
-        let sh = ServerHandle {};
-        test_session(
-            Client {},
-            sh,
-            |c| async move {
-                let mut ch = c.channel_open_session().await.unwrap();
-                ch.data(&b"hello world!"[..]).await.unwrap();
-
-                let msg = ch.wait().await.unwrap();
-                if let ChannelMsg::Data { data } = msg {
-                    assert_eq!(data.as_ref(), &b"hey there!"[..]);
-                } else {
-                    panic!("Unexpected message {:?}", msg);
-                }
-
-                let msg = ch.wait().await.unwrap();
-                let ChannelMsg::Close = msg else {
-                    panic!("Unexpected message {:?}", msg);
-                };
-
-                ch.close().await.unwrap();
-                c
-            },
-            |s| async move { s },
-        )
-        .await;
-    }
+pub(crate) fn future_or_pending<F: futures::Future, T>(
+    val: Option<T>,
+    f: impl FnOnce(T) -> F,
+) -> futures::future::Either<futures::future::Pending<<F as futures::Future>::Output>, F> {
+    val.map_or(
+        futures::future::Either::Left(futures::future::pending()),
+        |x| futures::future::Either::Right(f(x)),
+    )
 }

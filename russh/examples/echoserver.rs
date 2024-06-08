@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use russh::server::{Msg, Session};
+use russh::server::{Msg, Server as _, Session};
 use russh::*;
 use russh_keys::*;
 use tokio::sync::Mutex;
@@ -21,13 +21,11 @@ async fn main() {
         ..Default::default()
     };
     let config = Arc::new(config);
-    let sh = Server {
+    let mut sh = Server {
         clients: Arc::new(Mutex::new(HashMap::new())),
         id: 0,
     };
-    russh::server::run(config, ("0.0.0.0", 2222), sh)
-        .await
-        .unwrap();
+    sh.run_on_address(config, ("0.0.0.0", 2222)).await.unwrap();
 }
 
 #[derive(Clone)]
@@ -61,54 +59,54 @@ impl server::Handler for Server {
     type Error = anyhow::Error;
 
     async fn channel_open_session(
-        self,
+        &mut self,
         channel: Channel<Msg>,
-        session: Session,
-    ) -> Result<(Self, bool, Session), Self::Error> {
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
         {
             let mut clients = self.clients.lock().await;
             clients.insert((self.id, channel.id()), session.handle());
         }
-        Ok((self, true, session))
+        Ok(true)
     }
 
     async fn auth_publickey(
-        self,
+        &mut self,
         _: &str,
         _: &key::PublicKey,
-    ) -> Result<(Self, server::Auth), Self::Error> {
-        Ok((self, server::Auth::Accept))
+    ) -> Result<server::Auth, Self::Error> {
+        Ok(server::Auth::Accept)
     }
 
     async fn data(
-        mut self,
+        &mut self,
         channel: ChannelId,
         data: &[u8],
-        mut session: Session,
-    ) -> Result<(Self, Session), Self::Error> {
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
         let data = CryptoVec::from(format!("Got data: {}\r\n", String::from_utf8_lossy(data)));
         self.post(data.clone()).await;
         session.data(channel, data);
-        Ok((self, session))
+        Ok(())
     }
 
     async fn tcpip_forward(
-        self,
+        &mut self,
         address: &str,
         port: &mut u32,
-        session: Session,
-    ) -> Result<(Self, bool, Session), Self::Error> {
+        session: &mut Session,
+    ) -> Result<bool, Self::Error> {
         let handle = session.handle();
         let address = address.to_string();
         let port = *port;
         tokio::spawn(async move {
-            let mut channel = handle
+            let channel = handle
                 .channel_open_forwarded_tcpip(address, port, "1.2.3.4", 1234)
                 .await
                 .unwrap();
             let _ = channel.data(&b"Hello from a forwarded port"[..]).await;
             let _ = channel.eof().await;
         });
-        Ok((self, true, session))
+        Ok(true)
     }
 }

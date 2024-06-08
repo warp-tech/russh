@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 
-use russh_keys::encoding::{Encoding, Reader};
 use log::debug;
+use russh_keys::encoding::{Encoding, Reader};
 
 use super::*;
 use crate::cipher::SealingKey;
@@ -26,7 +26,7 @@ impl KexInit {
             let algo = {
                 // read algorithms from packet.
                 self.exchange.client_kex_init.extend(buf);
-                super::negotiation::Server::read_kex(buf, &config.preferred)?
+                super::negotiation::Server::read_kex(buf, &config.preferred, Some(&config.keys))?
             };
             if !self.sent {
                 self.server_write(config, cipher, write_buffer)?
@@ -44,6 +44,7 @@ impl KexInit {
                     session_id: self.session_id,
                 })
             } else {
+                debug!("unknown key {:?}", algo.key);
                 return Err(Error::UnknownKey);
             };
 
@@ -60,7 +61,11 @@ impl KexInit {
         write_buffer: &mut SSHBuffer,
     ) -> Result<(), Error> {
         self.exchange.server_kex_init.clear();
-        negotiation::write_kex(&config.preferred, &mut self.exchange.server_kex_init, true)?;
+        negotiation::write_kex(
+            &config.preferred,
+            &mut self.exchange.server_kex_init,
+            Some(config),
+        )?;
         debug!("server kex init: {:?}", &self.exchange.server_kex_init[..]);
         self.sent = true;
         cipher.write(&self.exchange.server_kex_init, write_buffer);

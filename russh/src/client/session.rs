@@ -1,6 +1,7 @@
+use log::error;
 use russh_cryptovec::CryptoVec;
 use russh_keys::encoding::Encoding;
-use log::error;
+use tokio::sync::oneshot;
 
 use crate::client::Session;
 use crate::session::EncryptedState;
@@ -81,7 +82,7 @@ impl Session {
 
     pub fn channel_open_direct_streamlocal(
         &mut self,
-        socket_path: &str
+        socket_path: &str,
     ) -> Result<ChannelId, crate::Error> {
         self.channel_open_generic(b"direct-streamlocal@openssh.com", |write| {
             write.extend_ssh_string(socket_path.as_bytes());
@@ -264,8 +265,23 @@ impl Session {
         }
     }
 
-    pub fn tcpip_forward(&mut self, want_reply: bool, address: &str, port: u32) {
+    /// Requests a TCP/IP forwarding from the server
+    ///
+    /// If `reply_channel` is not None, sets want_reply and returns the server's response via the channel,
+    /// [`Some<u32>`] for a success message with port, or [`None`] for failure
+    pub fn tcpip_forward(
+        &mut self,
+        reply_channel: Option<oneshot::Sender<Option<u32>>>,
+        address: &str,
+        port: u32,
+    ) {
         if let Some(ref mut enc) = self.common.encrypted {
+            let want_reply = reply_channel.is_some();
+            if let Some(reply_channel) = reply_channel {
+                self.open_global_requests.push_back(
+                    crate::session::GlobalRequestResponse::TcpIpForward(reply_channel),
+                );
+            }
             push_packet!(enc.write, {
                 enc.write.push(msg::GLOBAL_REQUEST);
                 enc.write.extend_ssh_string(b"tcpip-forward");
@@ -276,14 +292,41 @@ impl Session {
         }
     }
 
-    pub fn cancel_tcpip_forward(&mut self, want_reply: bool, address: &str, port: u32) {
+    /// Requests cancellation of TCP/IP forwarding from the server
+    ///
+    /// If `want_reply` is `true`, returns a oneshot receiveing the server's reply:
+    /// `true` for a success message, or `false` for failure
+    pub fn cancel_tcpip_forward(
+        &mut self,
+        reply_channel: Option<oneshot::Sender<bool>>,
+        address: &str,
+        port: u32,
+    ) {
         if let Some(ref mut enc) = self.common.encrypted {
+            let want_reply = reply_channel.is_some();
+            if let Some(reply_channel) = reply_channel {
+                self.open_global_requests.push_back(
+                    crate::session::GlobalRequestResponse::CancelTcpIpForward(reply_channel),
+                );
+            }
             push_packet!(enc.write, {
                 enc.write.push(msg::GLOBAL_REQUEST);
                 enc.write.extend_ssh_string(b"cancel-tcpip-forward");
                 enc.write.push(want_reply as u8);
                 enc.write.extend_ssh_string(address.as_bytes());
                 enc.write.push_u32_be(port);
+            });
+        }
+    }
+
+    pub fn send_keepalive(&mut self, want_reply: bool) {
+        self.open_global_requests
+            .push_back(crate::session::GlobalRequestResponse::Keepalive);
+        if let Some(ref mut enc) = self.common.encrypted {
+            push_packet!(enc.write, {
+                enc.write.push(msg::GLOBAL_REQUEST);
+                enc.write.extend_ssh_string(b"keepalive@openssh.com");
+                enc.write.push(want_reply as u8);
             });
         }
     }
@@ -351,5 +394,18 @@ impl Session {
         } else {
             0
         }
+    }
+
+    /// Returns the SSH ID (Protocol Version + Software Version) the server sent when connecting
+    ///
+    /// This should contain only ASCII characters for implementations conforming to RFC4253, Section 4.2:
+    ///
+    /// > Both the 'protoversion' and 'softwareversion' strings MUST consist of
+    /// > printable US-ASCII characters, with the exception of whitespace
+    /// > characters and the minus sign (-).
+    ///
+    /// So it usually is fine to convert it to a `String` using `String::from_utf8_lossy`
+    pub fn remote_sshid(&self) -> &[u8] {
+        &self.common.remote_sshid
     }
 }
